@@ -34,7 +34,7 @@ from transformers.trainer_utils import has_length
 from transformers.utils import is_rich_available
 
 from ..data_utils import maybe_apply_chat_template
-from ..import_utils import is_weave_available, temporary_env
+from ..import_utils import is_weave_available, suppress_experimental_warning
 from ..models.utils import unwrap_model_for_generation
 from .utils import log_table_to_comet_experiment
 
@@ -55,8 +55,7 @@ if is_weave_available():
     from weave import EvaluationLogger
     from weave.trace.context import weave_client_context
 
-with temporary_env("TRL_EXPERIMENTAL_SILENCE", "1"):
-    from ..experimental.merge_model_callback import MergeModelCallback as _MergeModelCallback
+with suppress_experimental_warning():
     from ..experimental.winrate_callback import WinRateCallback as _WinRateCallback
 
 # Logger for module-level logging
@@ -596,17 +595,6 @@ class WeaveCallback(TrainerCallback):
                     logger.warning(f"Failed to finish evaluation logger: {finish_e}")
 
         self._last_logged_step = state.global_step
-
-
-class MergeModelCallback(_MergeModelCallback):
-    def __init__(self, *args, **kwargs):
-        warnings.warn(
-            "The `MergeModelCallback` is now located in `trl.experimental`. Please update your imports to "
-            "`from trl.experimental.merge_model_callback import MergeModelCallback`. The current import path will be "
-            "removed and no longer supported in TRL 0.27. For more information, see "
-            "https://github.com/huggingface/trl/issues/4223.",
-            stacklevel=2,
-        )
 
 
 class BEMACallback(TrainerCallback):
