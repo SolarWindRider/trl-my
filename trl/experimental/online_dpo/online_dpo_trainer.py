@@ -55,17 +55,11 @@ from ...data_utils import apply_chat_template, is_conversational, maybe_apply_ch
 from ...extras.profiling import profiling_context
 from ...extras.vllm_client import VLLMClient
 from ...import_utils import is_vllm_available
-from ...models.utils import (
-    create_reference_model,
-    prepare_deepspeed,
-    prepare_fsdp,
-    prepare_peft_model,
-    unwrap_model_for_generation,
-)
+from ...models.utils import create_reference_model, prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
 from ...trainer.base_trainer import BaseTrainer
 from ...trainer.utils import disable_dropout_in_model, empty_cache, ensure_master_addr_port, get_config_model_id, pad
 from ..judges import BasePairwiseJudge
-from ..utils import SIMPLE_CHAT_TEMPLATE, DPODataCollatorWithPadding, truncate_right
+from ..utils import SIMPLE_CHAT_TEMPLATE, DPODataCollatorWithPadding, prepare_peft_model, truncate_right
 from .online_dpo_config import OnlineDPOConfig
 
 
@@ -543,6 +537,8 @@ class OnlineDPOTrainer(BaseTrainer):
             # Remove None values
             generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
             self.generation_config = GenerationConfig(**generation_kwargs)
+            # Keep training-specific generation kwargs to overwrite model's original generation config
+            self.generation_kwargs = generation_kwargs
 
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
@@ -1105,7 +1101,10 @@ class OnlineDPOTrainer(BaseTrainer):
             with (
                 profiling_context(self, "transformers.generate"),
                 unwrap_model_for_generation(
-                    model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                    model,
+                    self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                    generation_kwargs=self.generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
                 ) as unwrapped_model,
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
