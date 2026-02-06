@@ -295,6 +295,7 @@ class TestPrepareMultimodalMessagesVLLM:
 
 
 class TestIsConversational(TrlTestCase):
+    # fmt: off
     conversational_examples = [
         {  # Language modeling
             "messages": [
@@ -322,6 +323,30 @@ class TestIsConversational(TrlTestCase):
             "rejected": [
                 {"role": "user", "content": "What color is the sky?"},
                 {"role": "assistant", "content": "It is green."},
+            ],
+        },
+        {  # Preference with tool calls
+            "prompt": [{"role": "user", "content": "What color is the sky?"}],
+            "chosen": [
+                {"role": "assistant", "tool_calls": [{"type": "function", "function": {"name": "get_color", "arguments": {"what": "sky"}}}]},
+                {"role": "tool", "name": "get_color", "content": "blue"},
+                {"role": "assistant", "content": "It is blue."},
+            ],
+            "rejected": [
+                {"role": "assistant", "tool_calls": [{"type": "function", "function": {"name": "get_color", "arguments": {"what": "tree"}}}]},
+                {"role": "tool", "name": "get_color", "content": "green"},
+                {"role": "assistant", "content": "It is green."},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "description": "Gets the color.",
+                        "name": "get_color",
+                        "parameters": {"properties": {"what": {"description": "What to get the color of.", "type": "string"}}, "required": ["what"], "type": "object"},
+                        "return": {"description": "The color.", "type": "string"},
+                    },
+                },
             ],
         },
         {  # Unpaired preference
@@ -386,6 +411,7 @@ class TestIsConversational(TrlTestCase):
             "label": True,
         },
     ]
+    # fmt: on
 
     non_conversational_examples = [
         {"prompt": "The sky is", "completion": " blue."},
@@ -431,7 +457,6 @@ class TestIsConversationalFromValue(TrlTestCase):
 class TestApplyChatTemplate(TrlTestCase):
     tokenizers = [
         "trl-internal-testing/tiny-CohereForCausalLM",
-        "trl-internal-testing/tiny-DbrxForCausalLM",
         "trl-internal-testing/tiny-DeepseekV3ForCausalLM",
         "trl-internal-testing/tiny-DeepseekV3ForCausalLM-0528",
         "trl-internal-testing/tiny-FalconMambaForCausalLM",

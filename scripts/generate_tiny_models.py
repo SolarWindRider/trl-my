@@ -27,8 +27,6 @@ from transformers import (
     BartModel,
     CohereConfig,
     CohereForCausalLM,
-    DbrxConfig,
-    DbrxForCausalLM,
     DeepseekV3Config,
     DeepseekV3ForCausalLM,
     FalconMambaConfig,
@@ -159,7 +157,7 @@ def init_weights_tiny_model(model):
 # Decoder models
 for model_id, config_class, model_class, dtype, suffix in [
     # ("bigscience/bloomz-560m", BloomConfig, BloomForCausalLM, None),  # loading fails with this model, see https://huggingface.co/bigscience/bloomz-560m/discussions/14
-    ("CohereForAI/aya-expanse-8b", CohereConfig, CohereForCausalLM, torch.float16, None),
+    ("CohereLabs/aya-expanse-8b", CohereConfig, CohereForCausalLM, torch.float16, None),
     ("deepseek-ai/DeepSeek-R1", DeepseekV3Config, DeepseekV3ForCausalLM, torch.bfloat16, None),
     # It's important to have R1-0528 as it doesn't have the same chat template
     ("deepseek-ai/DeepSeek-R1-0528", DeepseekV3Config, DeepseekV3ForCausalLM, torch.bfloat16, "0528"),
@@ -214,19 +212,6 @@ for model_id, config_class, model_class, dtype, suffix in [
     model = model_class(config).to(dtype=dtype)
     init_weights_tiny_model(model)
     push_to_hub(model, tokenizer, generation_config, "tiny", suffix)
-
-# Special case for databricks/dbrx-instruct as it requires specific changes in the config
-model_id = "databricks/dbrx-instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-generation_config = GenerationConfig.from_pretrained(model_id)
-config = DbrxConfig.from_pretrained(model_id, n_layers=2, n_heads=6, d_model=24)
-# transformers mistakenly ignores ffn_config keys when loading from pretrained. We need to set them manually after
-# loading the config
-config.ffn_config.ffn_hidden_size = 24
-config.attn_config.kv_n_heads = 2
-model = DbrxForCausalLM(config).to(dtype=torch.bfloat16)
-init_weights_tiny_model(model)
-push_to_hub(model, tokenizer, generation_config, "tiny")
 
 # Two slightly bigger models, required for vLLM testing
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-32B-Instruct")
