@@ -51,7 +51,6 @@ from ..data_utils import (
     maybe_convert_to_chatml,
     pack_dataset,
     prepare_multimodal_messages,
-    truncate_dataset,
 )
 from ..models import get_act_offloading_ctx_manager
 from .base_trainer import _BaseTrainer
@@ -572,6 +571,8 @@ class SFTTrainer(_BaseTrainer):
             Function to use to form a batch from a list of elements of the processed `train_dataset` or `eval_dataset`.
             Will default to [`~trainer.sft_trainer.DataCollatorForLanguageModeling`] if the model is a language model
             and [`~trainer.sft_trainer.DataCollatorForVisionLanguageModeling`] if the model is a vision-language model.
+            Custom collators must truncate sequences before padding; the trainer does not apply post-collation
+            truncation.
         train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
             Dataset to use for training. This trainer supports both [language modeling](#language-modeling) type and
             [prompt-completion](#prompt-completion) type. The format of the samples can be either:
@@ -913,6 +914,12 @@ class SFTTrainer(_BaseTrainer):
             )
 
         # Dataset
+        if self.padding_free and not args.packing and args.max_length is not None and not self._is_vision_dataset:
+            raise ValueError(
+                "When `padding_free=True` without packing, `max_length` is not enforced. Either enable packing "
+                "(e.g., `packing=True, packing_strategy='bfd'`), provide already truncated inputs, or set "
+                "`max_length=None`."
+            )
         # Skip dataset preparation if `skip_prepare_dataset=True` in `dataset_kwargs`, or if it's a VLM, where
         # preprocessing (e.g., image-to-pixel conversion) is too costly and done on the fly instead.
         skip_prepare_dataset = (
@@ -920,12 +927,6 @@ class SFTTrainer(_BaseTrainer):
             and args.dataset_kwargs.get("skip_prepare_dataset", False)
             or self._is_vision_dataset
         )
-        if skip_prepare_dataset and self.padding_free and args.max_length is not None and not self._is_vision_dataset:
-            raise ValueError(
-                "When `padding_free=True`, `max_length` must be enforced during dataset preparation or packing, not in "
-                "the collator. Disable `skip_prepare_dataset`, provide already packed/truncated inputs, or set "
-                "`max_length=None`."
-            )
         if not skip_prepare_dataset:
             if self.completion_only_loss and formatting_func:
                 raise ValueError(
@@ -1001,6 +1002,40 @@ class SFTTrainer(_BaseTrainer):
 
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
+
+    def _tokenize(
+        self,
+        processing_class: PreTrainedTokenizerBase | ProcessorMixin,
+        input: str | list,
+        **kwargs,
+    ) -> dict[str, list]:
+        """Tokenize a single example for dataset preprocessing.
+
+        Dispatches to `apply_chat_template` for conversational input (list of message dicts) and to `__call__` for
+        non-conversational input (str). For VLMs, normalizes the batch dimension that processors emit even for single
+        examples.
+
+        Args:
+            processing_class ([`~transformers.PreTrainedTokenizerBase`] or [`~transformers.ProcessorMixin`]):
+                The tokenizer or processor to use.
+            input (`str` or `list`):
+                A string for non-conversational input, or a list of message dicts for conversational input.
+            **kwargs:
+                Forwarded to `apply_chat_template` (e.g. `add_generation_prompt`, `return_assistant_tokens_mask`).
+
+        Returns:
+            `dict` with at least an `"input_ids"` key mapping to a flat `list[int]`.
+        """
+        if isinstance(input, list):  # conversational: list of message dicts
+            if self._is_vlm:
+                input = prepare_multimodal_messages(input, images=[])
+            result = processing_class.apply_chat_template(input, tokenize=True, return_dict=True, **kwargs)
+        else:  # non-conversational: plain text string
+            result = processing_class(text=input)
+        # VLMs emit a batch dimension even for single examples; unwrap it
+        if self._is_vlm:
+            return {k: v[0] for k, v in result.items()}
+        return result
 
     def _prepare_dataset(
         self,
@@ -1087,53 +1122,28 @@ class SFTTrainer(_BaseTrainer):
                     if "prompt" in example:  # prompt-completion case
                         output = {}
                         if is_conversational(example):
-                            if self._is_vlm:
-                                prompt = prepare_multimodal_messages(example["prompt"], images=[])
-                                completion = prepare_multimodal_messages(example["completion"], images=[])
-                            else:
-                                prompt = example["prompt"]
-                                completion = example["completion"]
-                            prompt_ids = processing_class.apply_chat_template(
-                                prompt,
+                            prompt_ids = self._tokenize(
+                                processing_class,
+                                example["prompt"],
                                 tools=tools,
                                 add_generation_prompt=True,
-                                tokenize=True,
-                                return_dict=False,
                                 **example.get("chat_template_kwargs", {}),
-                            )
-                            # Fix transformers inconsistency: for VLMs, apply_chat_template returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            prompt_ids = prompt_ids[0] if isinstance(prompt_ids[0], list) else prompt_ids
-                            prompt_completion_processed = processing_class.apply_chat_template(
-                                prompt + completion,
+                            )["input_ids"]
+                            prompt_completion_processed = self._tokenize(
+                                processing_class,
+                                example["prompt"] + example["completion"],
                                 tools=tools,
-                                tokenize=True,
-                                return_dict=True,
                                 return_assistant_tokens_mask=assistant_only_loss,
                                 **example.get("chat_template_kwargs", {}),
                             )
-                            # Fix transformers inconsistency: for VLMs, apply_chat_template returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            prompt_completion_processed = {
-                                k: v[0] if isinstance(v[0], list) else v
-                                for k, v in prompt_completion_processed.items()
-                            }
                             prompt_completion_ids = prompt_completion_processed["input_ids"]
                             if "assistant_masks" in prompt_completion_processed:
                                 output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
                         else:
-                            prompt_ids = processing_class(text=example["prompt"])["input_ids"]
-                            prompt_completion_ids = processing_class(text=example["prompt"] + example["completion"])[
-                                "input_ids"
-                            ]
-                            # Fix transformers inconsistency: for VLMs, processing_class returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            prompt_ids = prompt_ids[0] if isinstance(prompt_ids[0], list) else prompt_ids
-                            prompt_completion_ids = (
-                                prompt_completion_ids[0]
-                                if isinstance(prompt_completion_ids[0], list)
-                                else prompt_completion_ids
-                            )
+                            prompt_ids = self._tokenize(processing_class, example["prompt"])["input_ids"]
+                            prompt_completion_ids = self._tokenize(
+                                processing_class, example["prompt"] + example["completion"]
+                            )["input_ids"]
 
                         # Check if the tokenized prompt starts with the tokenized prompt+completion
                         if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
@@ -1150,24 +1160,18 @@ class SFTTrainer(_BaseTrainer):
 
                     else:  # language modeling case
                         if is_conversational(example):
-                            if self._is_vlm:
-                                messages = prepare_multimodal_messages(example["messages"], images=[])
-                            else:
-                                messages = example["messages"]
-                            processed = processing_class.apply_chat_template(
-                                messages,
+                            processed = self._tokenize(
+                                processing_class,
+                                example["messages"],
                                 tools=tools,
-                                tokenize=True,
-                                return_dict=True,
                                 return_assistant_tokens_mask=assistant_only_loss,
                                 **example.get("chat_template_kwargs", {}),
                             )
-                            # Fix transformers inconsistency: for VLMs, apply_chat_template returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            processed = {k: v[0] if isinstance(v[0], list) else v for k, v in processed.items()}
                             output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
                         else:
-                            output = {"input_ids": processing_class(text=example[dataset_text_field])["input_ids"]}
+                            output = {
+                                "input_ids": self._tokenize(processing_class, example[dataset_text_field])["input_ids"]
+                            }
 
                     if "assistant_masks" in output and 1 not in output["assistant_masks"]:
                         raise RuntimeError(
@@ -1188,7 +1192,7 @@ class SFTTrainer(_BaseTrainer):
                     **map_kwargs,
                 )
 
-            # Pack or truncate
+            # Pack
             if packing:
                 if args.max_length is None:
                     raise ValueError("When packing is enabled, `max_length` can't be `None`.")
@@ -1210,12 +1214,6 @@ class SFTTrainer(_BaseTrainer):
 
                 # Packing adds new column "seq_lengths" needed for document aware FlashAttention
                 dataset = pack_dataset(dataset, args.max_length, args.packing_strategy, map_kwargs)
-            elif args.max_length is not None:
-                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
-                    map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
-                dataset = truncate_dataset(
-                    dataset, args.max_length, truncation_mode=args.truncation_mode, map_kwargs=map_kwargs
-                )
             # For Liger kernel, ensure only the essential columns
             if args.use_liger_kernel:
                 collator_expected_keys = {"input_ids", "seq_lengths", "completion_mask", "assistant_masks"}
